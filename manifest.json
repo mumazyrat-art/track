@@ -1,0 +1,9 @@
+{
+    "display_name": "Статус аккаунта Syntx",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "Syntx API",
+    "version": "2.0.0"
+}
