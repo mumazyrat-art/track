@@ -20,6 +20,13 @@
  * то же самое и всегда на виду, дублировать незачем. Следить за запросом расширение при
  * этом не перестаёт — окошко у кружка обновляется как раз из этих опросов.
  *
+ * В настройках, под строкой состояния, те же строки с остатком лимита, что и в дашборде:
+ * сколько процентов 6-часового и недельного окна осталось и сколько ждать до сброса
+ * (точное время сброса — в подсказке). Числа приходят с сервера (/account/limits) раз в
+ * минуту, пока открыта таверна: к моменту, когда настройки раскрыли, они уже на месте.
+ * Сервер их кэширует, поэтому до самого Syntx доходит не больше одного запроса в минуту
+ * на аккаунт, сколько бы человек ни сидело в таверне.
+ *
  * Кружок на экране («Иконка» в настройках) — то же самое, но не залезая в настройки.
  * Тап открывает окошко со статусом рядом с ним, ещё один — закрывает; кружок таскается
  * пальцем и помнит своё место. «Сброс» ставит его в середину экрана: на планшете окно
@@ -44,6 +51,7 @@ const FETCH_TIMEOUT_MS = 4000;      // потолок на один запрос
 const GIVE_UP_MS = 15 * 60 * 1000;  // страховка: когда-нибудь перестать спрашивать
 const STATUS_POLL_MS = 3000;        // как часто ходить за состоянием, пока на него смотрят
 const STATUS_TICK_MS = 1000;        // как часто перерисовывать таймер между запросами
+const LIMITS_POLL_MS = 60000;       // ровно кэш сервера: чаще спрашивать нечего, числа те же
 const SKIP_TYPES = ['quiet'];       // фоновые генерации (саммари и подобное) не показываем
 const HEADER = 'X-Queue-Id';
 const DOT_PX = 40;                  // размер кружка; он же — габарит при удержании в экране
@@ -397,6 +405,173 @@ function wantStatus(who, on) {
 }
 
 
+// ---------- Оставшиеся лимиты ----------
+
+/**
+ * Остаток лимитов по включённым аккаунтам. null — сервер недоступен или отвечает не тем;
+ * шуметь из-за этого незачем, в настройках просто будет видно, что числа не пришли.
+ */
+async function fetchLimits() {
+    const { url, key } = config();
+    const base = normalizeBase(url);
+    if (!base || !key) return null;
+    try {
+        const response = await fetch(`${base}/account/limits`, {
+            cache: 'no-store',
+            headers: { Authorization: `Bearer ${key}` },
+            signal: typeof AbortSignal?.timeout === 'function'
+                ? AbortSignal.timeout(FETCH_TIMEOUT_MS) : undefined,
+        });
+        if (!response.ok) return null;
+        const data = await response.json();
+        return Array.isArray(data?.accounts) ? data.accounts : null;
+    } catch {
+        return null;
+    }
+}
+
+/** Время сброса коротко: 23.10 18:30. */
+function when(iso) {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString('ru', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+/** Цвет остатка — те же пороги, что в дашборде: меньше 20% тревожно, меньше 50% обычно. */
+function limitColor(percent) {
+    if (percent < 20) return '#f87171';
+    if (percent < 50) return '';
+    return '#4ade80';
+}
+
+/** Сколько осталось до момента iso: «40 мин», «2 ч 10 мин», «5 дн 3 ч». */
+function leftUntil(iso) {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return '';
+    const minutes = Math.round((date.getTime() - Date.now()) / 60000);
+    if (minutes <= 0) return 'меньше минуты';
+    if (minutes < 60) return `${minutes} мин`;
+    const hours = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    if (hours < 24) return mins ? `${hours} ч ${mins} мин` : `${hours} ч`;
+    const days = Math.floor(hours / 24);
+    const restHours = hours % 24;
+    return restHours ? `${days} дн ${restHours} ч` : `${days} дн`;
+}
+
+/**
+ * Одно окно: «6ч: 85%» и сколько осталось до сброса. Точное время сброса — в подсказке.
+ * Сброшенное окно помечено сервером: иначе отсчёт, которого ещё нет, не отличить от
+ * отсчёта, которого не будет.
+ */
+function limitWindow(label, limit) {
+    const left = limit?.percent_left;
+    if (left === null || left === undefined) return { text: `${label}: —`, left: '', color: '', title: '' };
+    const percent = Math.round(Number(left));
+    const until = limit.expires_at ? leftUntil(limit.expires_at) : '';
+    return {
+        text: `${label}: ${percent}%`,
+        left: until ? `через ${until}` : (limit.reset ? 'сброшено' : ''),
+        color: limitColor(percent),
+        title: limit.expires_at ? `сброс ${when(limit.expires_at)}` : '',
+    };
+}
+
+/**
+ * Что показать в настройках: по строке на аккаунт, в тех же числах, что и дашборд.
+ * Возвращает структуру, а не готовый HTML, чтобы это можно было проверить без браузера.
+ */
+function limitLines(accounts) {
+    if (!Array.isArray(accounts)) {
+        return [{ name: '', windows: [], plan: '', note: 'Лимиты: сервер не ответил', color: '#fbbf24', title: '' }];
+    }
+    if (!accounts.length) {
+        return [{ name: '', windows: [], plan: '', note: 'Лимиты: нет включённых аккаунтов', color: '', title: '' }];
+    }
+    return accounts.map((account) => {
+        const name = String(account?.name ?? '').trim();
+        if (account?.error) {
+            return { name, windows: [], plan: '', note: 'лимиты не прочитались',
+                     color: '#fbbf24', title: String(account.error) };
+        }
+        const resting = Boolean(account?.rest_until);
+        const restLeft = resting ? leftUntil(account.rest_until) : '';
+        return {
+            name,
+            windows: [limitWindow('6ч', account?.window_6h), limitWindow('7д', account?.window_7d)],
+            plan: typeof account?.plan === 'string' ? account.plan : '',
+            note: resting ? `⏸ отдых new: ещё ${restLeft}` : '',
+            color: resting ? '#f87171' : '',
+            title: resting ? `до ${when(account.rest_until)}` : '',
+        };
+    });
+}
+
+/**
+ * Аккаунт — строкой с именем, и под ней по строке на окно: «6ч: 85% через 2 ч 10 мин».
+ * В одну строку оба окна с остатком времени не влезают, а на двух не разберёшь, где
+ * кончается одно и начинается другое.
+ *
+ * Имя аккаунта и тариф приходят с сервера, поэтому только textContent — без innerHTML.
+ */
+function drawLimits(host, lines) {
+    const doc = globalThis.document;
+    if (!host || !doc) return;
+    host.textContent = '';
+    for (const line of lines) {
+        const block = doc.createElement('div');
+        block.style.cssText = 'margin-top:4px';
+        const row = (cells) => {
+            const el = doc.createElement('div');
+            el.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap';
+            let filled = false;
+            for (const cell of cells) {
+                if (!cell?.text) continue;
+                const span = doc.createElement('span');
+                span.textContent = cell.text;
+                if (cell.color) span.style.color = cell.color;
+                if (cell.title) span.title = cell.title;
+                if (cell.dim) span.style.opacity = cell.dim;
+                el.append(span);
+                filled = true;
+            }
+            if (filled) block.append(el);
+        };
+        row([{ text: line.name, dim: '.8' },
+             { text: line.plan, dim: '.6' },
+             { text: line.note, color: line.color, title: line.title }]);
+        for (const part of line.windows) {
+            row([{ text: part.text, color: part.color, title: part.title },
+                 { text: part.left, title: part.title, dim: '.6' }]);
+        }
+        host.append(block);
+    }
+}
+
+// Последний ответ про лимиты: undefined — ещё не спрашивали, null — сервер не ответил.
+let limits;
+
+async function askLimits() {
+    limits = await fetchLimits();
+    showLimits();
+}
+
+function showLimits() {
+    if (limits === undefined) return;   // ещё не знаем — пусть стоит заглушка
+    drawLimits(globalThis.document?.getElementById('syntx-account-limits'), limitLines(limits));
+}
+
+// Спрашиваем всё время, пока открыта таверна, а не только пока раскрыты настройки:
+// иначе человеку пришлось бы открыть их и ждать минуту, прежде чем появятся числа.
+let limitsPoll = null;
+
+function startLimits() {
+    if (limitsPoll) return;
+    limitsPoll = setInterval(askLimits, LIMITS_POLL_MS);
+    askLimits();
+}
+
+
 // ---------- Плавающий кружок ----------
 
 /**
@@ -627,6 +802,9 @@ const SETTINGS_HTML = `
       </label>
       <div style="margin-top:10px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.06)">
         <span id="syntx-account-live" style="font-size:13px">Состояние: —</span>
+        <div id="syntx-account-limits" style="font-size:13px;line-height:1.35">
+          <div style="margin-top:3px;opacity:.7">Лимиты: …</div>
+        </div>
       </div>
       <div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <button id="syntx-account-check" class="menu_button">Проверить</button>
@@ -646,6 +824,7 @@ async function refreshStatusLine() {
     el.textContent = (ok ? '✅ ' : '⚠️ ') + text;
     el.style.color = ok ? '#4ade80' : '#fbbf24';
     redraw();
+    askLimits();
 }
 
 function mountSettings() {
@@ -698,6 +877,7 @@ function mountSettings() {
     });
     if (isOpen()) wantStatus('settings', true);
 
+    showLimits();        // настройки собрались заново — вернуть в них то, что уже знаем
     refreshStatusLine();
 }
 
@@ -715,6 +895,7 @@ function subscribe() {
     events.on(types.GENERATION_STOPPED, stopWatching);
     mountSettings();
     syncWidget();
+    startLimits();
     if (types.APP_READY) events.on(types.APP_READY, () => { mountSettings(); syncWidget(); });
 }
 
@@ -727,5 +908,7 @@ export const _internals = {
     tavernSource, tavernApi, checkStatus, accountLine, remember, redraw,
     clampPos, centerPos, resetPosition, syncWidget, toggleBubble, wantStatus,
     onGenerationStarted, onSettingsReady, mountSettings, stopWatching, fetchAccount,
+    when, leftUntil, limitColor, limitWindow, limitLines, drawLimits, fetchLimits,
+    askLimits, showLimits, startLimits, _limits: () => limits, _setLimits: (v) => { limits = v; },
     _live: () => live, _setLive: (v) => { live = v; },
 };
